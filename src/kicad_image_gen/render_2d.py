@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 import shutil
 import subprocess
@@ -309,8 +310,8 @@ def _export_svg_with_fill_opacity(
     merged_path = _merge_svgs(svg_paths)
     # Clean up individual SVGs (except the base one that was merged and is being returned)
     for svg_path in svg_paths[1:]:
-        print(f"Cleaning up intermediate SVG: {svg_path}")
-        #_cleanup(svg_path)
+        #print(f"Cleaning up intermediate SVG: {svg_path}")
+        _cleanup(svg_path)
     return merged_path
 
 
@@ -343,7 +344,7 @@ def _apply_fill_opacity(svg_path: Path, fill_opacity: float) -> None:
         last_group = all_groups[-1]
         # check if the style attribute has a opacity property, and if so, modify it. Otherwise, set opacity on the group.
         style = last_group.get("style", "")
-        print(f"Original style: '{style}'")
+        #print(f"Original style: '{style}'")
         style_parts = [part.strip() for part in style.split(";") if part.strip()]
         for i, part in enumerate(style_parts):
             if part.startswith("opacity:"):
@@ -355,7 +356,7 @@ def _apply_fill_opacity(svg_path: Path, fill_opacity: float) -> None:
         new_style = "; ".join(style_parts)
         last_group.set("style", new_style)
 
-        print(f"Modified style: '{new_style}'")
+        #print(f"Modified style: '{new_style}'")
         modified = True
     
     if modified:
@@ -520,13 +521,64 @@ _NET_NAME_COLOR = "#9988aa"
 _KEEPOUT_FILL = "#ff2222"
 _KEEPOUT_FILL_OPACITY = "0.18"
 _KEEPOUT_STROKE = "#ff4444"
-_KEEPOUT_STROKE_WIDTH = "0.25"
+_KEEPOUT_STROKE_WIDTH = "0.1"
 _KEEPOUT_STROKE_OPACITY = "0.6"
 
 # Grid dots
 _GRID_DOT_COLOR = "#1a2a3a"
 _GRID_DOT_RADIUS = 0.04  # mm
 _GRID_SPACING = 1.27  # mm (50mil grid, matching KiCad default)
+
+
+def _draw_oval_tht(parent_group, pad, offset_x: float, offset_y: float) -> None:
+    """Draw a through-hole oval (slot) as a capsule shape.
+    
+    An oval slot consists of two circles at the ends and connecting lines.
+    For visualization, we render the DRILL size, not the full pad size.
+    The offset between centers is (major_length - minor_diameter) / 2.
+    """
+    pad_minor = pad.size
+    pad_major = pad.size_major
+    pad_offset = (pad_major - pad_minor) / 2
+
+    drill_minor = pad.drill
+    drill_major = pad.drill_major
+    drill_offset = (drill_major - drill_minor) / 2
+
+    # Rotation in radians
+    rot_rad = math.radians(pad.rotation)
+    cos_rot = math.cos(rot_rad)
+    sin_rot = math.sin(rot_rad)
+    
+    # Calculate positions of the two end circles for the drill
+    pad_c1_x = pad.x - offset_x + pad_offset * cos_rot
+    pad_c1_y = pad.y - offset_y + pad_offset * sin_rot
+    pad_c2_x = pad.x - offset_x - pad_offset * cos_rot
+    pad_c2_y = pad.y - offset_y - pad_offset * sin_rot
+
+    drill_c1_x = pad.x - offset_x + drill_offset * cos_rot
+    drill_c1_y = pad.y - offset_y + drill_offset * sin_rot
+    drill_c2_x = pad.x - offset_x - drill_offset * cos_rot
+    drill_c2_y = pad.y - offset_y - drill_offset * sin_rot
+
+    line = ET.SubElement(parent_group, f"{{{_SVG_NS}}}line")
+    line.set("x1", f"{pad_c1_x:.4f}")
+    line.set("y1", f"{pad_c1_y:.4f}")
+    line.set("x2", f"{pad_c2_x:.4f}")
+    line.set("y2", f"{pad_c2_y:.4f}")
+    line.set("stroke", "#b8860b")
+    line.set("stroke-width", f"{pad_minor:.4f}")
+    line.set("stroke-linecap", "round")
+
+
+    line = ET.SubElement(parent_group, f"{{{_SVG_NS}}}line")
+    line.set("x1", f"{drill_c1_x:.4f}")
+    line.set("y1", f"{drill_c1_y:.4f}")
+    line.set("x2", f"{drill_c2_x:.4f}")
+    line.set("y2", f"{drill_c2_y:.4f}")
+    line.set("stroke", _BG_COLOR)
+    line.set("stroke-width", f"{drill_minor:.4f}")
+    line.set("stroke-linecap", "round")
 
 
 def _inject_overlays(
@@ -666,8 +718,30 @@ def _inject_overlays(
         modified = True
         logger.info("Injected %d via markers into SVG", len(vias))
 
-    # --- THT drill holes (disabled — theme handles via_hole color) ---
-    # tht_pads = parse_tht_pads(pcb_path)
+    # --- THT drill holes (plated through holes from footprints) ---
+    tht_pads = parse_tht_pads(pcb_path)
+    if tht_pads:
+        tht_group = ET.SubElement(root, f"{{{_SVG_NS}}}g")
+        tht_group.set("id", "tht-pads")
+        for pad in tht_pads:
+            if pad.is_oval:
+                # Draw oval/slot as a capsule shape
+                _draw_oval_tht(tht_group, pad, offset_x, offset_y)
+            else:
+                # Draw circular pad
+                outer = ET.SubElement(tht_group, f"{{{_SVG_NS}}}circle")
+                outer.set("cx", f"{pad.x - offset_x:.4f}")
+                outer.set("cy", f"{pad.y - offset_y:.4f}")
+                outer.set("r", f"{pad.size / 2:.4f}")
+                outer.set("fill", "#b8860b")  # dark goldenrod
+                # Inner circle (drill hole)
+                inner = ET.SubElement(tht_group, f"{{{_SVG_NS}}}circle")
+                inner.set("cx", f"{pad.x - offset_x:.4f}")
+                inner.set("cy", f"{pad.y - offset_y:.4f}")
+                inner.set("r", f"{pad.drill / 2:.4f}")
+                inner.set("fill", _BG_COLOR)
+        modified = True
+        logger.info("Injected %d through-hole pad markers into SVG", len(tht_pads))
 
     # --- Keepout zones (semi-transparent red polygons with dashed outline) ---
     if keepout:

@@ -215,7 +215,7 @@ class PadLabel:
 
 
 _RE_PAD_SIZE = re.compile(r"\(size\s+([-\d.]+)\s+([-\d.]+)\)")
-_RE_PAD_DRILL = re.compile(r"\(drill\s+([-\d.]+)")
+_RE_PAD_DRILL = re.compile(r"\(drill\s+(?:oval\s+)?([\-\d.]+)(?:\s+([\-\d.]+))?")
 
 
 @dataclass(frozen=True)
@@ -229,12 +229,20 @@ class MountingHole:
 
 @dataclass(frozen=True)
 class THTpad:
-    """A through-hole pad with position, size, and drill."""
+    """A through-hole pad with position, size, and drill.
+    
+    For circular pads: size and drill are diameters.
+    For oval pads: size and drill are (minor_diameter, major_length).
+    """
 
     x: float
     y: float
-    size: float  # pad diameter in mm
-    drill: float  # drill diameter in mm
+    size: float  # pad diameter (or minor diameter for ovals) in mm
+    drill: float  # drill diameter (or minor diameter for ovals) in mm
+    is_oval: bool = False  # True if pad is oval shaped
+    size_major: float = 0.0  # major length for ovals; for circles this equals size
+    drill_major: float = 0.0  # major length for oval drill; for circles this equals drill
+    rotation: float = 0.0  # pad rotation in degrees
 
 
 def parse_mounting_holes(pcb_path: str | Path) -> list[MountingHole]:
@@ -257,23 +265,61 @@ def parse_mounting_holes(pcb_path: str | Path) -> list[MountingHole]:
 
 
 def parse_tht_pads(pcb_path: str | Path) -> list[THTpad]:
-    """Parse through-hole (plated) pad positions with size and drill from a .kicad_pcb file."""
+    """Parse through-hole (plated) pad positions with size and drill from a .kicad_pcb file.
+    
+    Handles both circular and oval (slot) pads.
+    """
     pads: list[THTpad] = []
     for fp_x, fp_y, fp_rot, block, _refdes in _parse_footprint_blocks(pcb_path):
         for m in re.finditer(r"\(pad\s", block):
-            pad_block = block[m.start() : m.start() + 500]
-            if "thru_hole" not in pad_block or "np_thru_hole" in pad_block:
+            pad_block = block[m.start() : m.start() + 800]  # increased size to capture oval drill
+            if "thru_hole" not in pad_block:# or "np_thru_hole" in pad_block:
                 continue
             pad_at = _RE_AT.search(pad_block)
             if not pad_at:
                 continue
             pad_x, pad_y = float(pad_at.group(1)), float(pad_at.group(2))
+            pad_rot = float(pad_at.group(3)) if pad_at.group(3) else 0.0
             rx, ry = _rotate_point(pad_x, pad_y, fp_rot)
+            
+            # Check if this is an oval pad
+            is_oval = "oval" in pad_block
+            
             size_match = _RE_PAD_SIZE.search(pad_block)
             drill_match = _RE_PAD_DRILL.search(pad_block)
-            size = float(size_match.group(1)) if size_match else 1.5
-            drill = float(drill_match.group(1)) if drill_match else 0.8
-            pads.append(THTpad(x=fp_x + rx, y=fp_y + ry, size=size, drill=drill))
+            
+            # For size: if oval, extract both dimensions and sort so minor <= major
+            if size_match:
+                dim1 = float(size_match.group(1))
+                dim2 = float(size_match.group(2))
+                size_minor = min(dim1, dim2)
+                size_major = max(dim1, dim2)
+            else:
+                size_minor = 0
+                size_major = 0
+            
+            # For drill: if oval drill, extract both dimensions and sort so minor <= major
+            if drill_match:
+                drill1 = float(drill_match.group(1))
+                drill2 = float(drill_match.group(2)) if drill_match.group(2) else drill1
+                drill_minor = min(drill1, drill2)
+                drill_major = max(drill1, drill2)
+            else:
+                drill_minor = 0
+                drill_major = 0
+            
+            pads.append(
+                THTpad(
+                    x=fp_x + rx,
+                    y=fp_y + ry,
+                    size=size_minor,
+                    drill=drill_minor,
+                    is_oval=is_oval,
+                    size_major=size_major,
+                    drill_major=drill_major,
+                    rotation=fp_rot + pad_rot,
+                )
+            )
     return pads
 
 
