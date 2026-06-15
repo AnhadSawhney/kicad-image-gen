@@ -55,6 +55,9 @@ def render_2d(
     ratsnest: bool = True,
     pad_labels: bool = True,
     grid_dots: bool = False,
+    keepout: bool = True,
+    keep_svg: bool = False,
+    fill_opacity: int | None = None,
     crop: str | None = None,
     padding_mm: float = 5.0,
 ) -> Path:
@@ -77,6 +80,9 @@ def render_2d(
         ratsnest: Inject ratsnest lines showing signal-net connectivity (default True).
         pad_labels: Inject pad net-name labels at each pad location (default True).
         grid_dots: Inject subtle grid dot pattern in background (default True).
+        keepout: Inject keepout zone overlays (default True).
+        keep_svg: Save the intermediate SVG file alongside the PNG (default False).
+        fill_opacity: Opacity for copper fills (0.0-1.0). None for no modification.
         crop: Reference designator to zoom into (e.g. "U1"). None for full board.
         padding_mm: Context padding in mm around crop target (default 5.0).
 
@@ -101,14 +107,24 @@ def render_2d(
     # Resolve layer preset
     resolved_layers = LAYER_PRESETS.get(layers or "", layers or _DEFAULT_LAYERS_TOP)
 
-    # Step 1: Export SVG
-    svg_path = _export_svg(
-        pcb_path,
-        resolved_layers,
-        theme=theme,
-        mirror=mirror,
-        black_and_white=black_and_white,
-    )
+    # Step 1: Export SVG (with fill opacity handling if needed)
+    if fill_opacity is not None:
+        svg_path = _export_svg_with_fill_opacity(
+            pcb_path,
+            resolved_layers,
+            fill_opacity,
+            theme=theme,
+            mirror=mirror,
+            black_and_white=black_and_white,
+        )
+    else:
+        svg_path = _export_svg(
+            pcb_path,
+            resolved_layers,
+            theme=theme,
+            mirror=mirror,
+            black_and_white=black_and_white,
+        )
     if svg_path is None:
         msg = "SVG export failed — ensure kicad-cli supports 'pcb export svg'"
         raise RuntimeError(msg)
@@ -120,6 +136,7 @@ def render_2d(
         ratsnest=ratsnest,
         pad_labels=pad_labels,
         grid_dots=grid_dots,
+        keepout=keepout,
         crop=crop,
         padding_mm=padding_mm,
     )
@@ -128,8 +145,13 @@ def render_2d(
     try:
         png_path = _convert_svg_to_png(svg_path, output_path, width)
     finally:
-        print(svg_path)
-        #_cleanup(svg_path)
+        if not keep_svg:
+            _cleanup(svg_path)
+        else:
+            svg_output = output_path.with_suffix(".svg")
+            shutil.copy2(svg_path, svg_output)
+            logger.info("SVG saved: %s", svg_output)
+            _cleanup(svg_path)
 
     if png_path is None:
         msg = (
@@ -204,6 +226,184 @@ def _export_svg(
         os.close(fd)
         shutil.copy2(svg_out, tmp_path)
         return Path(tmp_path)
+
+
+def _separate_copper_layers(layer_list: str) -> tuple[list[str], list[str]]:
+    """Separate copper layers from non-copper layers.
+    
+    Args:
+        layer_list: Comma-separated layer names (e.g., "F.Cu,B.SilkS,B.Cu")
+    
+    Returns:
+        Tuple of (copper_layers, non_copper_layers) as lists
+    """
+    layers = [l.strip() for l in layer_list.split(",")]
+    copper_layers = [l for l in layers if "Cu" in l]
+    non_copper_layers = [l for l in layers if "Cu" not in l]
+    return copper_layers, non_copper_layers
+
+
+def _export_svg_with_fill_opacity(
+    pcb_path: Path,
+    layers: str,
+    fill_opacity: float,
+    *,
+    theme: str | None = None,
+    mirror: bool = False,
+    black_and_white: bool = False,
+) -> Path | None:
+    """Export SVG with copper layers handled separately for fill opacity.
+    
+    Exports non-copper layers together, then exports each copper layer
+    separately, applies fill opacity, and merges them back together.
+    
+    Args:
+        pcb_path: Path to .kicad_pcb file
+        layers: Comma-separated layer list
+        fill_opacity: Opacity value (0.0-1.0) to apply to copper fills
+        theme: KiCad color theme name
+        mirror: Mirror the board
+        black_and_white: Black and white rendering
+    
+    Returns:
+        Path to merged SVG or None on failure
+    """
+    copper_layers, non_copper_layers = _separate_copper_layers(layers)
+    
+    svg_paths: list[Path] = []
+    
+    # Export non-copper layers if any
+    if non_copper_layers:
+        non_copper_str = ",".join(non_copper_layers)
+        svg_path = _export_svg(
+            pcb_path,
+            non_copper_str,
+            theme=theme,
+            mirror=mirror,
+            black_and_white=black_and_white,
+        )
+        if svg_path:
+            svg_paths.append(svg_path)
+    
+    # Export each copper layer separately with fill opacity applied
+    for copper_layer in copper_layers:
+        svg_path = _export_svg(
+            pcb_path,
+            copper_layer,
+            theme=theme,
+            mirror=mirror,
+            black_and_white=black_and_white,
+        )
+        if svg_path:
+            _apply_fill_opacity(svg_path, fill_opacity)
+            svg_paths.append(svg_path)
+    
+    if not svg_paths:
+        return None
+    
+    # If only one SVG, return it directly
+    if len(svg_paths) == 1:
+        return svg_paths[0]
+    
+    # Merge multiple SVGs
+    merged_path = _merge_svgs(svg_paths)
+    # Clean up individual SVGs (except the base one that was merged and is being returned)
+    for svg_path in svg_paths[1:]:
+        print(f"Cleaning up intermediate SVG: {svg_path}")
+        #_cleanup(svg_path)
+    return merged_path
+
+
+def _apply_fill_opacity(svg_path: Path, fill_opacity: float) -> None:
+    """Apply opacity to filled zones (last group) in a single-layer SVG.
+    
+    Args:
+        svg_path: Path to the SVG file.
+        fill_opacity: Opacity value (0.0-1.0).
+    """
+    if not (0.0 <= fill_opacity <= 1.0):
+        logger.warning("fill_opacity out of range (0.0-1.0): %.3f — ignoring", fill_opacity)
+        return
+    
+    ET.register_namespace("", _SVG_NS)
+    try:
+        tree = ET.parse(str(svg_path))
+    except ET.ParseError:
+        logger.warning("Failed to parse SVG for fill opacity adjustment")
+        return
+    
+    root = tree.getroot()
+    opacity_str = f"{fill_opacity:.3f}"
+    modified = False
+    
+    # Find all groups in the SVG
+    all_groups = root.findall(f"{{{_SVG_NS}}}g")
+    if all_groups:
+        # The last group contains the filled zones for this layer
+        last_group = all_groups[-1]
+        # check if the style attribute has a opacity property, and if so, modify it. Otherwise, set opacity on the group.
+        style = last_group.get("style", "")
+        print(f"Original style: '{style}'")
+        style_parts = [part.strip() for part in style.split(";") if part.strip()]
+        for i, part in enumerate(style_parts):
+            if part.startswith("opacity:"):
+                style_parts[i] = f"opacity:{opacity_str}"
+                break
+        else:
+            style_parts.append(f"opacity:{opacity_str}")
+        
+        new_style = "; ".join(style_parts)
+        last_group.set("style", new_style)
+
+        print(f"Modified style: '{new_style}'")
+        modified = True
+    
+    if modified:
+        tree.write(str(svg_path), xml_declaration=True, encoding="unicode")
+        logger.debug("Applied fill-opacity %.3f to layer fills", fill_opacity)
+
+
+def _merge_svgs(svg_paths: list[Path]) -> Path:
+    """Merge multiple SVG files into a single SVG.
+    
+    All content (groups and elements) from source SVGs is merged into the first SVG's root.
+    
+    Args:
+        svg_paths: List of SVG file paths to merge
+    
+    Returns:
+        Path to the merged SVG file (first input file is modified and returned)
+    """
+    if not svg_paths:
+        msg = "No SVG paths provided for merging"
+        raise ValueError(msg)
+    
+    ET.register_namespace("", _SVG_NS)
+    
+    # Parse the first SVG (this will be the base)
+    base_path = svg_paths[0]
+    base_tree = ET.parse(str(base_path))
+    base_root = base_tree.getroot()
+    
+    # Merge all other SVGs into the base
+    for svg_path in svg_paths[1:]:
+        try:
+            other_tree = ET.parse(str(svg_path))
+            other_root = other_tree.getroot()
+            
+            # Copy all child elements from other SVG to base SVG
+            for child in other_root:
+                base_root.append(child)
+            
+            logger.debug("Merged %s into base SVG", svg_path)
+        except ET.ParseError:
+            logger.warning("Failed to parse SVG for merging: %s", svg_path)
+            continue
+    
+    # Write the merged SVG back to the base path
+    base_tree.write(str(base_path), xml_declaration=True, encoding="unicode")
+    logger.info("Merged %d SVGs into %s", len(svg_paths), base_path)
+    return base_path
 
 
 def _convert_svg_to_png(
@@ -336,6 +536,7 @@ def _inject_overlays(
     ratsnest: bool = True,
     pad_labels: bool = True,
     grid_dots: bool = True,
+    keepout: bool = True,
     crop: str | None = None,
     padding_mm: float = 5.0,
 ) -> None:
@@ -469,7 +670,10 @@ def _inject_overlays(
     # tht_pads = parse_tht_pads(pcb_path)
 
     # --- Keepout zones (semi-transparent red polygons with dashed outline) ---
-    keepout_zones = parse_keepout_zones(pcb_path)
+    if keepout:
+        keepout_zones = parse_keepout_zones(pcb_path)
+    else:
+        keepout_zones = []
     if keepout_zones:
         keepout_group = ET.SubElement(root, f"{{{_SVG_NS}}}g")
         keepout_group.set("id", "keepout-zones")

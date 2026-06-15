@@ -55,7 +55,23 @@ def _build_parser() -> argparse.ArgumentParser:
     p2d.add_argument(
         "--no-ratsnest",
         action="store_true",
-        help="Disable ratsnest overlay (composite mode only)",
+        help="Disable ratsnest overlay",
+    )
+    p2d.add_argument(
+        "--no-keepout",
+        action="store_true",
+        help="Disable keepout zone overlays",
+    )
+    p2d.add_argument(
+        "--keep-svg",
+        action="store_true",
+        help="Save the intermediate SVG file alongside the PNG",
+    )
+    p2d.add_argument(
+        "--fill-opacity",
+        type=float,
+        default=None,
+        help="Opacity for copper fills (0.0-1.0, default: no modification)",
     )
     p2d.add_argument(
         "--crop",
@@ -146,6 +162,10 @@ def _cmd_2d(args: argparse.Namespace) -> None:
             theme=args.theme,
             mirror=args.mirror,
             black_and_white=args.bw,
+            ratsnest=not args.no_ratsnest,
+            keepout=not args.no_keepout,
+            keep_svg=args.keep_svg,
+            fill_opacity=args.fill_opacity,
             crop=args.crop,
             padding_mm=args.padding,
         )
