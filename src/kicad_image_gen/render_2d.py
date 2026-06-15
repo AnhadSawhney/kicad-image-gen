@@ -128,7 +128,8 @@ def render_2d(
     try:
         png_path = _convert_svg_to_png(svg_path, output_path, width)
     finally:
-        _cleanup(svg_path)
+        print(svg_path)
+        #_cleanup(svg_path)
 
     if png_path is None:
         msg = (
@@ -356,6 +357,20 @@ def _inject_overlays(
 
     # --- Expand viewBox for margin, then add background fill ---
     vb_parts = viewbox.split()
+    
+    # --- Calculate coordinate offset between SVG viewBox and board bounds ---
+    # KiCad's SVG export may normalize the viewBox to (0,0) even though .kicad_pcb
+    # coordinates have a different origin. We need to offset all overlays accordingly.
+    offset_x = 0.0
+    offset_y = 0.0
+    try:
+        bx0, by0, _bx1, _by1 = parse_board_bounds(pcb_path)
+        vb_x_start, vb_y_start = float(vb_parts[0]), float(vb_parts[1])
+        offset_x = bx0 - vb_x_start
+        offset_y = by0 - vb_y_start
+        logger.debug("Coordinate offset: (%.2f, %.2f)", offset_x, offset_y)
+    except (ValueError, OSError, IndexError):
+        logger.debug("Could not calculate coordinate offset — using (0, 0)")
     if len(vb_parts) == 4:
         vb_x, vb_y = float(vb_parts[0]), float(vb_parts[1])
         vb_w, vb_h = float(vb_parts[2]), float(vb_parts[3])
@@ -422,8 +437,8 @@ def _inject_overlays(
         mh_group.set("id", "mounting-holes")
         for hole in mounting_holes:
             circle = ET.SubElement(mh_group, f"{{{_SVG_NS}}}circle")
-            circle.set("cx", f"{hole.x:.4f}")
-            circle.set("cy", f"{hole.y:.4f}")
+            circle.set("cx", f"{hole.x - offset_x:.4f}")
+            circle.set("cy", f"{hole.y - offset_y:.4f}")
             circle.set("r", f"{hole.diameter / 2 * 1.25:.4f}")
             circle.set("fill", _MOUNTING_HOLE_COLOR)
         modified = True
@@ -437,14 +452,14 @@ def _inject_overlays(
         for v in vias:
             # Outer circle (copper color)
             outer = ET.SubElement(via_group, f"{{{_SVG_NS}}}circle")
-            outer.set("cx", f"{v.x:.4f}")
-            outer.set("cy", f"{v.y:.4f}")
+            outer.set("cx", f"{v.x - offset_x:.4f}")
+            outer.set("cy", f"{v.y - offset_y:.4f}")
             outer.set("r", f"{v.size / 2:.4f}")
             outer.set("fill", "#b8860b")  # dark goldenrod
             # Inner circle (drill hole)
             inner = ET.SubElement(via_group, f"{{{_SVG_NS}}}circle")
-            inner.set("cx", f"{v.x:.4f}")
-            inner.set("cy", f"{v.y:.4f}")
+            inner.set("cx", f"{v.x - offset_x:.4f}")
+            inner.set("cy", f"{v.y - offset_y:.4f}")
             inner.set("r", f"{v.drill / 2:.4f}")
             inner.set("fill", _BG_COLOR)
         modified = True
@@ -459,7 +474,7 @@ def _inject_overlays(
         keepout_group = ET.SubElement(root, f"{{{_SVG_NS}}}g")
         keepout_group.set("id", "keepout-zones")
         for zone in keepout_zones:
-            pts_str = " ".join(f"{x:.4f},{y:.4f}" for x, y in zone.points)
+            pts_str = " ".join(f"{x - offset_x:.4f},{y - offset_y:.4f}" for x, y in zone.points)
             polygon = ET.SubElement(keepout_group, f"{{{_SVG_NS}}}polygon")
             polygon.set("points", pts_str)
             polygon.set("fill", _KEEPOUT_FILL)
@@ -486,10 +501,10 @@ def _inject_overlays(
                 edges = nearest_neighbor_ratsnest(pads)
                 for i, j in edges:
                     line = ET.SubElement(ratsnest_group, f"{{{_SVG_NS}}}line")
-                    line.set("x1", f"{pads[i][0]:.4f}")
-                    line.set("y1", f"{pads[i][1]:.4f}")
-                    line.set("x2", f"{pads[j][0]:.4f}")
-                    line.set("y2", f"{pads[j][1]:.4f}")
+                    line.set("x1", f"{pads[i][0] - offset_x:.4f}")
+                    line.set("y1", f"{pads[i][1] - offset_y:.4f}")
+                    line.set("x2", f"{pads[j][0] - offset_x:.4f}")
+                    line.set("y2", f"{pads[j][1] - offset_y:.4f}")
                     line.set("stroke", _RATSNEST_COLOR)
                     line.set("stroke-width", _RATSNEST_STROKE_WIDTH)
                     line_count += 1
@@ -518,8 +533,8 @@ def _inject_overlays(
                     # Vertical centering: shift down by ~0.35 * font_size
                     y_offset = num_font * 0.35
                     num_el = ET.SubElement(labels_group, f"{{{_SVG_NS}}}text")
-                    num_el.set("x", f"{pad.x:.4f}")
-                    num_el.set("y", f"{pad.y + y_offset:.4f}")
+                    num_el.set("x", f"{pad.x - offset_x:.4f}")
+                    num_el.set("y", f"{pad.y + y_offset - offset_y:.4f}")
                     num_el.set("font-size", f"{num_font:.3f}")
                     num_el.set("font-family", "sans-serif")
                     num_el.set("font-weight", "bold")
@@ -536,8 +551,8 @@ def _inject_overlays(
                     )
                     net_y_offset = pad.pad_height / 2 + net_font * 1.2
                     net_el = ET.SubElement(labels_group, f"{{{_SVG_NS}}}text")
-                    net_el.set("x", f"{pad.x:.4f}")
-                    net_el.set("y", f"{pad.y + net_y_offset:.4f}")
+                    net_el.set("x", f"{pad.x - offset_x:.4f}")
+                    net_el.set("y", f"{pad.y + net_y_offset - offset_y:.4f}")
                     net_el.set("font-size", f"{net_font:.3f}")
                     net_el.set("font-family", "sans-serif")
                     net_el.set("fill", _NET_NAME_COLOR)
